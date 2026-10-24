@@ -27,6 +27,10 @@ public final class JavaScriptCallback: Sendable {
   /// on the JavaScript thread, by `deinit` or by the teardown sweep.
   @JavaScriptActor
   private final class LongLivedState: LongLivedObject {
+    // Unchecked exclusivity skips the dynamic access checks on every call. After `init`, only
+    // `allowRelease` writes it, from a scheduled task or the teardown sweep, so the write can't
+    // overlap a call that borrows the function.
+    @exclusivity(unchecked)
     var function: JavaScriptFunction?
 
     func allowRelease() {
@@ -84,15 +88,31 @@ public final class JavaScriptCallback: Sendable {
   // MARK: - Calling
 
   // The generic methods are inlinable so the encodes and decodes specialize in the caller's module.
-  // They carry the arguments to the JavaScript thread in an unchecked box, because the argument types
-  // may not be `Sendable`. A blocking or async call waits until the arguments are encoded; a detached
-  // call doesn't.
+  // On the JavaScript thread, `invokeDetached` and `invokeBlocking` call the function inline through
+  // `invokeInline`, which takes non-escaping closures, so a call allocates nothing. Other calls carry
+  // the arguments to the JavaScript thread in an unchecked box, because the argument types may not
+  // be `Sendable`. A blocking or async call waits until the arguments are encoded; a detached call
+  // doesn't.
 
   /// Calls the function with `arguments` without waiting for it. A JavaScript error is reported with
   /// ``reportError(_:)``. On the JavaScript thread, the function runs before this method returns.
   @inlinable
   public func invokeDetached<each A: JavaScriptEncodable>(_ arguments: repeat each A) {
     let box = UncheckedSendableBox((repeat each arguments))
+    do {
+      let argumentCount = Self.argumentCount(of: repeat (each A).self)
+      let calledInline = try invokeInline(argumentCount: argumentCount) { buffer, runtime in
+        let arguments = box.value
+        try Self.encodeArguments(repeat each arguments, into: buffer, in: runtime)
+      } decodeResult: { _, _ in
+      }
+      if calledInline {
+        return
+      }
+    } catch {
+      reportError(error)
+      return
+    }
     runDetached { runtime in
       let arguments = box.value
       return try Self.encodeArguments(repeat each arguments, in: runtime)
@@ -106,6 +126,15 @@ public final class JavaScriptCallback: Sendable {
   @inlinable
   public func invokeBlocking<each A: JavaScriptEncodable>(_ arguments: repeat each A) throws {
     let box = UncheckedSendableBox((repeat each arguments))
+    let argumentCount = Self.argumentCount(of: repeat (each A).self)
+    let calledInline = try invokeInline(argumentCount: argumentCount) { buffer, runtime in
+      let arguments = box.value
+      try Self.encodeArguments(repeat each arguments, into: buffer, in: runtime)
+    } decodeResult: { _, _ in
+    }
+    if calledInline {
+      return
+    }
     let _: UncheckedSendableBox<Void> = try runBlocking { runtime in
       let arguments = box.value
       return try Self.encodeArguments(repeat each arguments, in: runtime)
@@ -124,6 +153,19 @@ public final class JavaScriptCallback: Sendable {
     returning _: R.Type
   ) throws -> sending R {
     let box = UncheckedSendableBox((repeat each arguments))
+    // Set by `decodeResult`, which runs synchronously inside `invokeInline`.
+    nonisolated(unsafe) var inlineResult: R?
+    let argumentCount = Self.argumentCount(of: repeat (each A).self)
+    let calledInline = try invokeInline(argumentCount: argumentCount) { buffer, runtime in
+      let arguments = box.value
+      try Self.encodeArguments(repeat each arguments, into: buffer, in: runtime)
+    } decodeResult: { value, runtime in
+      inlineResult = try R.decode(value, in: runtime)
+    }
+    if calledInline {
+      // `invokeInline` returns `true` only after `decodeResult` set the result.
+      return inlineResult!
+    }
     let result = try runBlocking { runtime in
       let arguments = box.value
       return try Self.encodeArguments(repeat each arguments, in: runtime)
@@ -181,6 +223,30 @@ public final class JavaScriptCallback: Sendable {
     return buffer
   }
 
+  /// Encodes the arguments of an inline call into `buffer`, whose slots hold `undefined`.
+  @inlinable
+  @JavaScriptActor
+  internal static func encodeArguments<each A: JavaScriptEncodable>(
+    _ arguments: repeat each A,
+    into buffer: borrowing JavaScriptValuesBuffer,
+    in runtime: JavaScriptRuntime
+  ) throws {
+    var index = 0
+    for argument in repeat each arguments {
+      try buffer.encode(argument, at: index, in: runtime)
+      index += 1
+    }
+  }
+
+  @inlinable
+  internal static func argumentCount<each A>(of types: repeat (each A).Type) -> Int {
+    var count = 0
+    for _ in repeat each types {
+      count += 1
+    }
+    return count
+  }
+
   @inlinable
   @JavaScriptActor
   internal static func encodeArgument<A: JavaScriptEncodable>(
@@ -209,6 +275,70 @@ public final class JavaScriptCallback: Sendable {
 
   // The non-generic part of the calls, compiled in the framework. `encodeArguments` and
   // `decodeResult` run on the JavaScript thread.
+
+  /// Calls the function when the caller is on the JavaScript thread, and returns `false` without
+  /// calling it on any other thread. `encodeArguments` fills a buffer of `argumentCount` values and
+  /// `decodeResult` reads the result in place.
+  @usableFromInline
+  internal func invokeInline(
+    argumentCount: Int,
+    encodeArguments: @JavaScriptActor (borrowing JavaScriptValuesBuffer, JavaScriptRuntime) throws -> Void,
+    decodeResult: @JavaScriptActor (borrowing JavaScriptUnownedValue, JavaScriptRuntime) throws -> Void
+  ) throws -> Bool {
+    guard let unretainedRuntime = try scheduler.unretainedLiveRuntimeIfOnJavaScriptThread() else {
+      return false
+    }
+    // The arguments and the result live on the stack for the call. All slots hold `undefined` first,
+    // so they stay valid to destroy when an encode or the call throws. This part is nonisolated:
+    // an isolated closure passed to the standard library checks the current executor on every call.
+    let error = withUnsafeTemporaryAllocation(of: facebook.jsi.Value.self, capacity: argumentCount + 1) {
+      storage -> (any Error)? in
+      // The isolated closure below runs synchronously on this thread.
+      nonisolated(unsafe) let arguments = storage.baseAddress!
+      nonisolated(unsafe) let result = arguments + argumentCount
+      for index in 0...argumentCount {
+        expo.emplaceUndefined(arguments + index)
+      }
+      defer {
+        expo.destroyValues(arguments, argumentCount + 1)
+      }
+      // The runtime outlives a synchronous call on its JavaScript thread, so it's borrowed without
+      // a retain. The isolated closure returns the error, so it can use the nonthrowing
+      // `assumeIsolated`.
+      return unretainedRuntime._withUnsafeGuaranteedRef { runtime in
+        return JavaScriptActor.assumeIsolated { () -> (any Error)? in
+          do {
+            try encodeArguments(JavaScriptValuesBuffer(runtime, start: arguments, count: argumentCount), runtime)
+            try callFunction(arguments: arguments, count: argumentCount, result: result)
+            try decodeResult(JavaScriptUnownedValue(runtime.pointee, result), runtime)
+            return nil
+          } catch {
+            return error
+          }
+        }
+      }
+    }
+    if let error {
+      throw error
+    }
+    return true
+  }
+
+  /// Calls the function with `count` values at `arguments` and moves its result into `result`, which
+  /// holds `undefined`. Throws ``RuntimeLostError`` after the teardown sweep released the function.
+  @JavaScriptActor
+  private func callFunction(
+    arguments: UnsafePointer<facebook.jsi.Value>,
+    count: Int,
+    result: UnsafeMutablePointer<facebook.jsi.Value>
+  ) throws {
+    switch longLivedState.function {
+    case .some(let function):
+      return try function.call(arguments: arguments, count: count, into: result)
+    case .none:
+      throw RuntimeLostError()
+    }
+  }
 
   @usableFromInline
   internal func runDetached(

@@ -65,6 +65,21 @@ public struct JavaScriptFunction: JavaScriptType, ~Copyable {
     }
   }
 
+  /// Calls the function with `count` values at `arguments` and moves its result into `result`, which
+  /// must hold a value that owns nothing, such as `undefined`.
+  internal func call(
+    arguments: UnsafePointer<facebook.jsi.Value>,
+    count: Int,
+    into result: UnsafeMutablePointer<facebook.jsi.Value>
+  ) throws {
+    guard let jsiRuntime else {
+      FatalError.runtimeLost()
+    }
+    // Creates no `JavaScriptValue` for the result, and reads the thread-local error only when the
+    // call throws.
+    try throwCppErrorUnlessSucceeded(expo.callFunctionInto(jsiRuntime, pointee, arguments, count, result))
+  }
+
   /// Calls the function with a single borrowed argument. The argument's `jsi::Value` is passed
   /// straight to the call, without copying it into an owned value or an arguments buffer.
   @discardableResult
